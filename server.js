@@ -4,11 +4,34 @@ import axios from "axios";
 import dotenv from "dotenv";
 import multer from "multer";
 import FormData from "form-data";
+import { OAuth2Client } from "google-auth-library";
+import fs from "fs";
+import path from "path";
+import { fileURLToPath } from "url";
 
 dotenv.config();
 
 const app = express();
-const upload = multer(); // Para manejar subida de archivos
+const upload = multer();
+const googleClient = new OAuth2Client(
+  process.env.GOOGLE_CLIENT_ID,
+  process.env.GOOGLE_CLIENT_SECRET,
+  "http://localhost:3000/auth/google/callback"
+);
+
+const LINKS_FILE = path.join(process.cwd(), "google-links.json");
+
+function getLinks() {
+  try {
+    return JSON.parse(fs.readFileSync(LINKS_FILE, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveLinks(links) {
+  fs.writeFileSync(LINKS_FILE, JSON.stringify(links, null, 2));
+}
 
 app.use(
   cors({
@@ -55,9 +78,111 @@ async function moodleCall(req, wsfunction, params = {}) {
   return data;
 }
 
+// Verificar si un email está registrado en Moodle
+async function isEmailInMoodle(email) {
+  try {
+    const adminToken = process.env.ADMIN_TOKEN;
+    if (!adminToken) {
+      console.log("⚠️ ADMIN_TOKEN no configurado, saltando validación de email");
+      return true; // Si no hay token admin, permitir por ahora
+    }
+
+    const url = `${MOODLE_BASE}/webservice/rest/server.php`;
+    const params = new URLSearchParams({
+      wstoken: adminToken,
+      wsfunction: "core_user_get_users_by_field",
+      moodlewsrestformat: "json",
+      field: "email",
+      "values[0]": email,
+    });
+
+    const { data } = await axios.post(url, params.toString(), {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    });
+
+    if (data?.exception || data?.errorcode) {
+      console.log("⚠️ Error buscando usuario:", data.message || data.errorcode);
+      return true; // En caso de error, permitir para no bloquear
+    }
+
+    return data && data.length > 0;
+  } catch (error) {
+    console.log("⚠️ Error verificando email:", error.message);
+    return true; // En caso de error, permitir
+  }
+}
+
 // ===== RUTAS =====
 
 app.get("/health", (req, res) => res.json({ ok: true, mode: "standard-auth" }));
+
+// OAuth Google - Inicio del flujo
+app.get("/auth/google/start", (req, res) => {
+  const authUrl = googleClient.generateAuthUrl({
+    access_type: "offline",
+    scope: ["email", "profile"],
+    prompt: "select_account",
+  });
+  res.redirect(authUrl);
+});
+
+// OAuth Google - Callback
+app.get("/auth/google/callback", async (req, res) => {
+  const { code } = req.query;
+
+  if (!code) {
+    return res.redirect("http://localhost:8081?error=no_code");
+  }
+
+  try {
+    const { tokens } = await googleClient.getToken(code);
+    const ticket = await googleClient.verifyIdToken({
+      idToken: tokens.id_token,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const email = payload.email;
+
+    // Verificar si ya está vinculado
+    const links = getLinks();
+    if (links[email]) {
+      // Auto-login
+      const { moodleUsername, moodlePassword } = links[email];
+      const loginUrl = `${MOODLE_BASE}/login/token.php`;
+      const params = new URLSearchParams({
+        username: moodleUsername,
+        password: moodlePassword,
+        service: MOODLE_SERVICE,
+      });
+
+      const { data: loginData } = await axios.post(loginUrl, params);
+
+      if (loginData.token) {
+        const userUrl = `${MOODLE_BASE}/webservice/rest/server.php`;
+        const userParams = new URLSearchParams({
+          wstoken: loginData.token,
+          wsfunction: "core_webservice_get_site_info",
+          moodlewsrestformat: "json",
+        });
+
+        const { data: userData } = await axios.post(userUrl, userParams);
+
+        return res.redirect(
+          `http://localhost:8081?token=${loginData.token}&user=${encodeURIComponent(JSON.stringify(userData))}`
+        );
+      }
+    }
+
+    // Necesita vincular
+    return res.redirect(
+      `http://localhost:8081?requires_linking=true&google_email=${email}&google_name=${encodeURIComponent(payload.name || "")}&id_token=${tokens.id_token}`
+    );
+  } catch (error) {
+    console.error("❌ Error en callback:", error);
+    return res.redirect(`http://localhost:8081?error=${encodeURIComponent(error.message)}`);
+  }
+});
 
 // 1. LOGIN (Devuelve Token Real)
 app.post("/auth/login", async (req, res) => {
@@ -95,6 +220,184 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
+// 2. LOGIN CON GOOGLE
+app.post("/auth/google", async (req, res) => {
+  try {
+    const { idToken } = req.body;
+    if (!idToken) return res.status(400).json({ ok: false, error: "Token no proporcionado" });
+
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+
+    const payload = ticket.getPayload();
+    const googleEmail = payload.email;
+    
+    // VALIDAR: Verificar si el email está registrado en Moodle
+    const emailExists = await isEmailInMoodle(googleEmail);
+    if (!emailExists) {
+      console.log("❌ Correo no registrado en Moodle:", googleEmail);
+      return res.status(403).json({ 
+        ok: false, 
+        error: "Correo no registrado. Este correo no está registrado en el sistema Moodle." 
+      });
+    }
+    
+    // Verificar si ya está vinculado
+    const links = getLinks();
+    const linkedAccount = links[googleEmail];
+    
+    if (linkedAccount) {
+      // Ya está vinculado, hacer login automático
+      console.log("✅ Cuenta vinculada encontrada para:", googleEmail);
+      const tokenUrl = `${MOODLE_BASE}/login/token.php`;
+      const { data: tokenData } = await axios.get(tokenUrl, {
+        params: { 
+          username: linkedAccount.moodleUsername, 
+          password: linkedAccount.moodlePassword, 
+          service: MOODLE_SERVICE 
+        },
+      });
+
+      if (tokenData?.error) {
+        // Credenciales cambiaron, pedir vincular de nuevo
+        delete links[googleEmail];
+        saveLinks(links);
+        return res.json({
+          ok: true,
+          requiresLinking: true,
+          googleUser: {
+            email: payload.email,
+            name: payload.name,
+            picture: payload.picture
+          }
+        });
+      }
+
+      const infoBody = new URLSearchParams({
+        wstoken: tokenData.token,
+        wsfunction: "core_webservice_get_site_info",
+        moodlewsrestformat: "json",
+      });
+      const { data: info } = await axios.post(`${MOODLE_BASE}/webservice/rest/server.php`, infoBody.toString());
+
+      return res.json({
+        ok: true,
+        token: tokenData.token,
+        user: {
+          id: info.userid,
+          fullname: info.fullname,
+          email: info.useremail || googleEmail,
+          avatar: info.userpictureurl || payload.picture,
+          googleEmail: payload.email,
+          linkedToGoogle: true
+        }
+      });
+    }
+
+    // No está vinculado - pedir vincular
+    console.log("📝 Correo no vinculado:", googleEmail);
+    res.json({
+      ok: true,
+      requiresLinking: true,
+      googleUser: {
+        email: payload.email,
+        name: payload.name,
+        picture: payload.picture
+      }
+    });
+  } catch (e) {
+    console.error("❌ Error login Google:", e);
+    res.status(500).json({ ok: false, error: "Error verificando token de Google" });
+  }
+});
+
+// 3. VINCULAR GOOGLE CON MOODLE
+app.post("/auth/link-google-moodle", async (req, res) => {
+  try {
+    const { idToken, username, password } = req.body;
+
+    if (!idToken || !username || !password) {
+      return res.status(400).json({ ok: false, error: "Faltan datos requeridos" });
+    }
+
+    console.log("📝 Vinculando Google con Moodle...");
+    
+    const ticket = await googleClient.verifyIdToken({
+      idToken,
+      audience: process.env.GOOGLE_CLIENT_ID,
+    });
+    const payload = ticket.getPayload();
+    const googleEmail = payload.email;
+    console.log("✅ Google verificado:", googleEmail);
+
+    const tokenUrl = `${MOODLE_BASE}/login/token.php`;
+    const { data: tokenData } = await axios.get(tokenUrl, {
+      params: { username, password, service: MOODLE_SERVICE },
+    });
+
+    if (tokenData?.error) {
+      console.log("❌ Error Moodle:", tokenData.error);
+      return res.status(401).json({ 
+        ok: false, 
+        error: "Usuario o contraseña de Moodle incorrectos" 
+      });
+    }
+
+    console.log("✅ Login Moodle exitoso");
+
+    const infoBody = new URLSearchParams({
+        wstoken: tokenData.token,
+        wsfunction: "core_webservice_get_site_info",
+        moodlewsrestformat: "json",
+    });
+    const { data: info } = await axios.post(`${MOODLE_BASE}/webservice/rest/server.php`, infoBody.toString());
+
+    console.log("✅ Info usuario obtenida:", info.fullname);
+
+    // VALIDACIÓN: Verificar que esta cuenta de Moodle no esté vinculada a otro correo
+    const links = getLinks();
+    const existingGoogleEmail = Object.keys(links).find(
+      email => links[email].moodleUsername === username && email !== googleEmail
+    );
+
+    if (existingGoogleEmail) {
+      console.log("❌ Cuenta ya vinculada a:", existingGoogleEmail);
+      return res.status(403).json({ 
+        ok: false, 
+        error: `Esta cuenta de Moodle ya está vinculada al correo ${existingGoogleEmail}. Una cuenta solo puede vincularse a un correo de Google.` 
+      });
+    }
+
+    // Guardar vinculación (sobrescribe si ya existía para este email)
+    links[googleEmail] = {
+      moodleUsername: username,
+      moodlePassword: password,
+      linkedAt: new Date().toISOString()
+    };
+    saveLinks(links);
+    console.log("💾 Vinculación guardada para:", googleEmail);
+
+    res.json({
+      ok: true,
+      token: tokenData.token,
+      user: {
+        id: info.userid,
+        fullname: info.fullname,
+        email: info.useremail || username,
+        avatar: info.userpictureurl || payload.picture,
+        googleEmail: payload.email,
+        linkedToGoogle: true
+      }
+    });
+  } catch (e) {
+    console.error("❌ Error en vincular:", e.message);
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // === MIDDLEWARE DE SEGURIDAD ===
 // A partir de aquí, todas las rutas exigen token
 app.use((req, res, next) => {
@@ -102,7 +405,7 @@ app.use((req, res, next) => {
     next();
 });
 
-// 2. CURSOS
+// 4. CURSOS
 app.get("/courses", async (req, res) => {
   try {
     const data = await moodleCall(req, "core_course_get_enrolled_courses_by_timeline_classification", {
@@ -114,7 +417,7 @@ app.get("/courses", async (req, res) => {
   }
 });
 
-// 3. CONTENIDOS
+// 5. CONTENIDOS
 app.get("/course/:courseId/contents", async (req, res) => {
   try {
     const contents = await moodleCall(req, "core_course_get_contents", { courseid: req.params.courseId });
@@ -124,7 +427,7 @@ app.get("/course/:courseId/contents", async (req, res) => {
   }
 });
 
-// 4. TAREAS (ASSIGNMENTS)
+// 6. TAREAS (ASSIGNMENTS)
 
 // ✅ NUEVO: Obtener estado de la entrega (Corrige el error de "Tipo no detectado")
 app.get("/assign/:assignId/status", async (req, res) => {
