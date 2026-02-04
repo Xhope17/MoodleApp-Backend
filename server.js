@@ -5,6 +5,7 @@ import routes from "./routes/index.js";
 
 const app = express();
 
+// Configurar CORS para permitir peticiones desde el frontend
 app.use(
   cors({
     origin: "*",
@@ -18,6 +19,7 @@ app.use(express.json({ limit: "50mb" }));
 
 app.use(routes);
 
+// Iniciar servidor
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Backend corriendo en puerto ${PORT}`);
 });

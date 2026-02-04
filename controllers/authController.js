@@ -75,7 +75,6 @@ export async function googleCallback(req, res) {
       `http://localhost:8081?requires_linking=true&google_email=${email}&google_name=${encodeURIComponent(payload.name || "")}&id_token=${tokens.id_token}`,
     );
   } catch (error) {
-    console.error("Error en callback:", error);
     return res.redirect(
       `http://localhost:8081?error=${encodeURIComponent(error.message)}`,
     );
@@ -141,7 +140,6 @@ export async function googleLogin(req, res) {
 
     const emailExists = await isEmailInMoodle(googleEmail);
     if (!emailExists) {
-      console.log("Correo no registrado en Moodle:", googleEmail);
       return res.status(403).json({
         ok: false,
         error:

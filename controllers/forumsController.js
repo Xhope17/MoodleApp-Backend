@@ -1,5 +1,17 @@
 import { moodleCall } from "../helpers/moodle.js";
 
+// Obtiene los detalles de todos los foros de un curso
+export async function getCourseForums(req, res) {
+  try {
+    const data = await moodleCall(req, "mod_forum_get_forums_by_courses", {
+      "courseids[0]": req.params.courseId,
+    });
+    res.json({ ok: true, forums: data || [] });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 // Obtiene las discusiones de un foro
 export async function getForumDiscussions(req, res) {
   try {

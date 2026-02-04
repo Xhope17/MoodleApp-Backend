@@ -3,12 +3,32 @@ import FormData from "form-data";
 import { moodleCall, getUserAuth } from "../helpers/moodle.js";
 import { MOODLE_BASE } from "../config/env.js";
 
+// Obtiene todas las tareas de un curso con sus detalles
+export async function getCourseAssignments(req, res) {
+  try {
+    const courseId = parseInt(req.params.courseId);
+    const data = await moodleCall(req, "mod_assign_get_assignments", {
+      "courseids[0]": courseId,
+    });
+    res.json({ ok: true, assignments: data.courses?.[0]?.assignments || [] });
+  } catch (e) {
+    console.error("Error en getCourseAssignments:", e.message);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+}
+
 // Obtiene el estado de una tarea y su entrega
 export async function getAssignmentStatus(req, res) {
   try {
+    // Primero obtener el userid del token
+    const userInfo = await moodleCall(req, "core_webservice_get_site_info", {});
+    const userId = userInfo.userid;
+    
     const data = await moodleCall(req, "mod_assign_get_submission_status", {
       assignid: req.params.assignId,
+      userid: userId,
     });
+    
     res.json({ ok: true, status: data });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
@@ -47,37 +67,16 @@ export async function submitAssignment(req, res) {
 // Sube un archivo como entrega de tarea
 export async function saveAssignmentFile(req, res) {
   try {
-    console.log("Request recibido - Headers:", req.headers["content-type"]);
-    console.log("Body keys:", Object.keys(req.body || {}));
-    console.log("File presente:", !!req.file);
-    console.log(
-      "File details:",
-      req.file
-        ? {
-            fieldname: req.file.fieldname,
-            originalname: req.file.originalname,
-            encoding: req.file.encoding,
-            mimetype: req.file.mimetype,
-            size: req.file.size,
-          }
-        : "No file",
-    );
-
     const token = getUserAuth(req);
     if (!token) {
-      console.log("Token no encontrado");
       return res.status(401).json({ ok: false, error: "Falta token" });
     }
 
     if (!req.file) {
-      console.log("Archivo no recibido");
-      console.log("Body completo:", req.body);
       return res
         .status(400)
         .json({ ok: false, error: "No se recibió archivo" });
     }
-
-    console.log("Token y archivo recibidos correctamente");
 
     const uploadUrl = `${MOODLE_BASE}/webservice/upload.php`;
 
@@ -108,18 +107,14 @@ export async function saveAssignmentFile(req, res) {
     }
 
     const draftItemId = uploadedFiles[0].itemid;
-    console.log(`Archivo subido a Draft Area. ItemID: ${draftItemId}`);
 
     const result = await moodleCall(req, "mod_assign_save_submission", {
       assignmentid: req.params.assignId,
       "plugindata[files_filemanager]": draftItemId,
     });
 
-    console.log("Entrega guardada correctamente");
     res.json({ ok: true, result });
   } catch (e) {
-    console.error("Error Upload completo:", e);
-    console.error("Stack:", e.stack);
     const errorMsg =
       e.response?.data?.message || e.message || "Error desconocido";
     res.status(500).json({ ok: false, error: errorMsg });

@@ -25,6 +25,8 @@ router.use(requireAuth);
 router.get("/courses", coursesController.getCourses);
 router.get("/course/:courseId/contents", coursesController.getCourseContents);
 router.get("/course/:courseId/grades", coursesController.getCourseGrades);
+router.get("/course/:courseId/assignments", assignmentsController.getCourseAssignments);
+router.get("/course/:courseId/forums", forumsController.getCourseForums);
 
 // TAREAS
 router.get(
