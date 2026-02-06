@@ -121,7 +121,7 @@ export async function saveAssignmentFile(req, res) {
   }
 }
 
-// Guarda la entrega combinada (texto + archivo) de una tarea
+// Guarda la entrega combinada (texto + archivos) de una tarea
 export async function saveAssignmentCombined(req, res) {
   try {
     const token = getUserAuth(req);
@@ -130,45 +130,55 @@ export async function saveAssignmentCombined(req, res) {
     }
 
     const { text } = req.body;
-    const hasFile = !!req.file;
-    const hasText = text && text.trim().length > 0;
+    const hasFiles = req.files && req.files.length > 0;
+    const hasText = text && text.trim && text.trim().length > 0;
 
-    if (!hasFile && !hasText) {
-      return res.status(400).json({ 
-        ok: false, 
-        error: "Debe proporcionar al menos texto o un archivo" 
-      });
-    }
+    // Permitir envíos vacíos para borrar entregas
+    // Si ambos están vacíos, se enviará un draft vacío a Moodle para limpiar la entrega
 
     let draftItemId = null;
 
-    // Si hay archivo, subirlo primero
-    if (hasFile) {
+    // Si hay archivos, subirlos todos
+    if (hasFiles) {
       const uploadUrl = `${MOODLE_BASE}/webservice/upload.php`;
-      const form = new FormData();
-      form.append("token", token);
-      form.append("file", req.file.buffer, req.file.originalname);
-
-      console.log("Subiendo archivo a Moodle:", uploadUrl);
-
-      const uploadRes = await axios.post(uploadUrl, form, {
-        headers: form.getHeaders(),
-      });
-
-      const uploadedFiles = uploadRes.data;
-      console.log("Respuesta de Moodle:", uploadedFiles);
-
-      if (uploadedFiles.error) {
-        throw new Error(uploadedFiles.error);
-      }
-      if (!Array.isArray(uploadedFiles) || uploadedFiles.length === 0) {
-        if (uploadedFiles.exception) {
-          throw new Error(uploadedFiles.message);
+      console.log(`Subiendo ${req.files.length} archivo(s) a Moodle...`);
+      
+      // Subir cada archivo al mismo draft area
+      for (let i = 0; i < req.files.length; i++) {
+        const file = req.files[i];
+        
+        const form = new FormData();
+        form.append("token", token);
+        form.append("file", file.buffer, file.originalname);
+        
+        // Si ya tenemos un draftItemId, lo usamos para agregar al mismo draft area
+        if (draftItemId !== null) {
+          form.append("itemid", String(draftItemId));
         }
-        throw new Error("Error desconocido al subir archivo al Draft Area");
-      }
 
-      draftItemId = uploadedFiles[0].itemid;
+        const uploadRes = await axios.post(uploadUrl, form, {
+          headers: form.getHeaders(),
+        });
+
+        const uploadedFiles = uploadRes.data;
+
+        if (uploadedFiles.error) {
+          throw new Error(uploadedFiles.error);
+        }
+        if (!Array.isArray(uploadedFiles) || uploadedFiles.length === 0) {
+          if (uploadedFiles.exception) {
+            throw new Error(uploadedFiles.message);
+          }
+          throw new Error("Error desconocido al subir archivo al Draft Area");
+        }
+
+        // Guardar el itemid del primer archivo
+        if (draftItemId === null) {
+          draftItemId = uploadedFiles[0].itemid;
+        }
+      }
+      
+      console.log(`✓ ${req.files.length} archivo(s) subido(s) exitosamente`);
     }
 
     // Preparar los datos para la llamada a Moodle
@@ -176,22 +186,37 @@ export async function saveAssignmentCombined(req, res) {
       assignmentid: req.params.assignId,
     };
 
-    // Agregar texto si existe
-    if (hasText) {
-      submissionData["plugindata[onlinetext_editor][text]"] = text;
+    // Si no hay texto ni archivos, es un borrado de entrega
+    const isDeleting = !hasText && !hasFiles;
+
+    if (isDeleting) {
+      console.log("🗑️ Detectado intento de borrado de entrega");
+      // Para borrar: enviar texto vacío y draft area vacío (itemid 0)
+      submissionData["plugindata[onlinetext_editor][text]"] = "";
       submissionData["plugindata[onlinetext_editor][format]"] = 1;
       submissionData["plugindata[onlinetext_editor][itemid]"] = 0;
+      submissionData["plugindata[files_filemanager]"] = 0;
+      console.log("Datos para borrar:", submissionData);
+    } else {
+      // Agregar texto si existe
+      if (hasText) {
+        submissionData["plugindata[onlinetext_editor][text]"] = text;
+        submissionData["plugindata[onlinetext_editor][format]"] = 1;
+        submissionData["plugindata[onlinetext_editor][itemid]"] = 0;
+      }
+
+      // Agregar archivos si existen
+      if (draftItemId !== null) {
+        submissionData["plugindata[files_filemanager]"] = draftItemId;
+      }
     }
-
-    // Agregar archivo si existe
-    if (draftItemId) {
-      submissionData["plugindata[files_filemanager]"] = draftItemId;
-    }
-
-    console.log("Guardando entrega con datos:", submissionData);
-
+    
     const result = await moodleCall(req, "mod_assign_save_submission", submissionData);
-
+    
+    if (isDeleting) {
+      console.log("✓ Respuesta de Moodle al borrar:", JSON.stringify(result, null, 2));
+    }
+    
     res.json({ ok: true, result });
   } catch (e) {
     const errorMsg = e.response?.data?.message || e.message || "Error desconocido";

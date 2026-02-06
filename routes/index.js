@@ -45,7 +45,7 @@ router.post(
 );
 router.post(
   "/assign/:assignId/save-combined",
-  upload.single("file"),
+  upload.array("file", 20),
   assignmentsController.saveAssignmentCombined,
 );
 

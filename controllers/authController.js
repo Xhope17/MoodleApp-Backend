@@ -15,7 +15,7 @@ export async function health(req, res) {
   res.json({ ok: true, mode: "standard-auth" });
 }
 
-// Inicia el flujo de autenticacion con Google
+// Inicia el flujo de autenticación con Google
 export async function googleStart(req, res) {
   const authUrl = googleClient.generateAuthUrl({
     access_type: "offline",
